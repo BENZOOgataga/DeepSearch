@@ -3,11 +3,14 @@ import os
 import json
 import asyncio
 import re
+import sys
 from pathlib import Path
+from cachetools import TTLCache
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from datetime import datetime
+
 
 # --- Load env and config ---
 load_dotenv()
@@ -67,13 +70,19 @@ def setup_logging():
     return msg_logger, user_logger, msg_log_path, user_log_path
 
 
-msg_logger, user_logger, msg_log_path, user_log_path = setup_logging()
-
 # --- Init bot ---
 intents = discord.Intents.all()
 intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+msg_logger, user_logger, msg_log_path, user_log_path = setup_logging()
+
+# --- Caches ---
+member_cache = TTLCache(maxsize=100, ttl=3600)
+message_cache = TTLCache(maxsize=100, ttl=300)
+user_cache = TTLCache(maxsize=100, ttl=3600)
+keyword_match_cache = {}
 
 
 # --- Utils ---
@@ -159,6 +168,61 @@ def update_scheduled_tasks():
             print("🛑 Auto-scan disabled")
 
 
+def get_cached_members(guild_id):
+    """Get or create cached member list for a guild"""
+    if guild_id not in member_cache:
+        guild = bot.get_guild(guild_id)
+        if guild:
+            member_cache[guild_id] = list(guild.members)
+    return member_cache.get(guild_id, [])
+
+
+async def get_cached_messages(channel_id, limit=100, force_refresh=False):
+    """Get or create cached message history for a channel"""
+    cache_key = f"{channel_id}_{limit}"
+    if force_refresh or cache_key not in message_cache:
+        channel = bot.get_channel(channel_id)
+        if channel:
+            messages = []
+            async for msg in channel.history(limit=limit):
+                messages.append(msg)
+            message_cache[cache_key] = messages
+    return message_cache.get(cache_key, [])
+
+
+async def get_cached_user(user_id):
+    """Get or create cached user information"""
+    if user_id not in user_cache:
+        try:
+            user = await bot.fetch_user(int(user_id))
+            user_cache[user_id] = user
+        except Exception:
+            return None
+    return user_cache.get(user_id)
+
+
+def keyword_match(text):
+    """Check if text contains any keywords with caching"""
+    # Use a short hash of the text as a cache key
+    cache_key = hash(text) % 10000000
+
+    if cache_key in keyword_match_cache:
+        return keyword_match_cache[cache_key]
+
+    # Perform the actual matching
+    result = any(k.lower() in text.lower() for k in CONFIG["search_keywords"])
+
+    # Cache the result
+    keyword_match_cache[cache_key] = result
+
+    # Limit cache size to prevent memory issues
+    if len(keyword_match_cache) > 10000:
+        # Remove a random item if cache gets too big
+        keyword_match_cache.pop(next(iter(keyword_match_cache)))
+
+    return result
+
+
 # --- Events ---
 @bot.event
 async def on_ready():
@@ -173,7 +237,7 @@ async def on_ready():
         print(f"🔍 Scanning guild: {guild.name} ({guild.id})")
         # Chunk only if necessary
         if not guild.chunked:
-            await guild.chunk()
+            await guild.chunk(cache=True)
         for member in guild.members:
             name_fields = f"{member.name} {member.display_name}"
             if keyword_match(name_fields):
@@ -227,52 +291,20 @@ async def show_keywords(ctx):
 
 @bot.command(name="scan")
 async def scan_members(ctx, *args):
-    """
-    Scan server with customizable options
-    Usage: !scan [--users/-u] [--messages/-m] [--all/-a]
-    """
     if not is_admin(ctx):
         return await ctx.send("❌ You must be a server admin to use this.")
 
-    # Parse arguments
-    scan_users = False
-    scan_messages = False
+    scan_users = "--users" in args or "-u" in args or "--all" in args or "-a" in args
+    scan_messages = "--messages" in args or "-m" in args or "--all" in args or "-a" in args
 
-    # Check arguments (converted to lowercase for easier comparison)
-    args_lower = [arg.lower() for arg in args]
+    if not scan_users and not scan_messages:
+        return await ctx.send("⚠️ Usage: `!scan [--users/-u] [--messages/-m] [--all/-a]`")
 
-    # Check for specific flags
-    if "--all" in args_lower or "-a" in args_lower:
-        scan_users = True
-        scan_messages = True
-    else:
-        if "--users" in args_lower or "-u" in args_lower:
-            scan_users = True
-        if "--messages" in args_lower or "-m" in args_lower:
-            scan_messages = True
-
-    # If no valid flags provided, show help
-    if not args or (not scan_users and not scan_messages):
-        return await ctx.send(
-            "⚠️ Usage: `!scan [--users/-u] [--messages/-m] [--all/-a]`\nYou must specify what to scan.")
-
-    # Inform what's being scanned
-    scan_types = []
-    if scan_users:
-        scan_types.append("members")
-    if scan_messages:
-        scan_types.append("messages")
-
-    await ctx.send(f"🔍 Starting scan of {' and '.join(scan_types)}...")
+    await ctx.send(f"🔍 Starting scan of {' and '.join(['members' if scan_users else '', 'messages' if scan_messages else '']).strip()}...")
 
     user_count = 0
     message_count = 0
 
-    # Ensure guild is chunked
-    if not ctx.guild.chunked:
-        await ctx.guild.chunk()
-
-    # Scan users if requested
     if scan_users:
         for member in ctx.guild.members:
             name_fields = f"{member.name} {member.display_name}"
@@ -281,31 +313,18 @@ async def scan_members(ctx, *args):
                 user_logger.info(entry)
                 user_count += 1
 
-    # Scan messages if requested
     if scan_messages:
         for channel in ctx.guild.text_channels:
             try:
-                # Get last 100 messages per channel
-                messages = [msg async for msg in channel.history(limit=100)]
-                for msg in messages:
+                async for msg in channel.history(limit=100):
                     if not msg.author.bot and keyword_match(msg.content):
                         entry = f"[MANUAL-SCAN] {msg.author} in #{msg.channel} ({msg.guild.name}) > {msg.content}"
                         msg_logger.info(entry)
                         message_count += 1
             except discord.Forbidden:
-                # Skip channels where we don't have permissions
                 continue
 
-    # Build summary message
-    results = []
-    if scan_users:
-        results.append(f"{user_count} matching members")
-    if scan_messages:
-        results.append(f"{message_count} matching messages")
-
-    summary = f"✅ Scan complete! Found {' and '.join(results)}."
-    await ctx.send(summary)
-    print(f"\n{summary}\n")
+    await ctx.send(f"✅ Scan complete! Found {user_count} matching members and {message_count} matching messages.")
 
 
 # Define search cooldowns dictionary
@@ -317,10 +336,8 @@ search_cancelled = False
 
 @bot.command(name="search")
 async def search_messages(ctx, *args):
-    """Search for messages containing a keyword with filters"""
     global search_cancelled, search_cooldowns
 
-    # Check if this is a cancellation request
     if len(args) == 1 and args[0].lower() == "cancel":
         if hasattr(search_messages, "is_running") and search_messages.is_running:
             search_cancelled = True
@@ -345,135 +362,102 @@ async def search_messages(ctx, *args):
         search_stats["searches_by_user"][user_name] = 0
     search_stats["searches_by_user"][user_name] += 1
 
-    # Global execution tracker
     if not hasattr(search_messages, "is_running"):
         search_messages.is_running = False
 
     if search_messages.is_running:
-        return await ctx.send(
-            "⚠️ A search is already running on the server. Please wait for it to complete or use `!search cancel` to stop it.")
+        return await ctx.send("⚠️ A search is already running on the server. Please wait for it to complete or use `!search cancel` to stop it.")
 
-    # Reset cancellation flag for new search
     search_cancelled = False
 
-    # Parse arguments
-    deep_search = False
-    query_limit = 500  # Default limit
-    custom_query = False
-    include_channels = []  # Channels to specifically include
-    exclude_channels = []  # Channels to exclude
+    deep_search = "--all" in args or "-a" in args
+    query_limit = 500
+    custom_query = "--q" in args or "--query" in args
+    include_channels = []
+    exclude_channels = []
 
-    # Process arguments
     processed_args = []
     i = 0
     while i < len(args):
-        # Check for deep search flag
-        if args[i].lower() in ("--all", "-a", "--a"):
+        if args[i].lower() in ("--all", "-a"):
             deep_search = True
-            query_limit = None  # Unlimited search
+            query_limit = None
             i += 1
             continue
-
-        # Check for custom query limit flag
         elif i + 1 < len(args) and args[i].lower() in ("--q", "--query"):
             try:
                 limit_str = args[i + 1].lower()
-                # Handle k/m suffixes (e.g., 100k = 100,000)
                 if limit_str.endswith('k'):
                     query_limit = int(float(limit_str[:-1]) * 1000)
                 elif limit_str.endswith('m'):
                     query_limit = int(float(limit_str[:-1]) * 1000000)
                 else:
                     query_limit = int(limit_str)
-
                 custom_query = True
-                deep_search = query_limit > 1000  # Consider deep if over 1000 messages
+                deep_search = query_limit > 1000
                 i += 2
                 continue
             except (ValueError, IndexError):
                 return await ctx.send("⚠️ Invalid query limit format. Example: `--q 10k` for 10,000 messages")
-
-        # Check for include channels flag
         elif args[i].lower() in ("--in", "--channel"):
             if i + 1 >= len(args):
                 return await ctx.send("⚠️ Please specify channel(s) after --in/--channel flag.")
-
-            # Extract channel mentions or IDs
             channels_arg = args[i + 1]
             for channel_mention in channels_arg.split(','):
                 channel_mention = channel_mention.strip()
                 try:
-                    # Extract channel ID from mention format <#123456789>
                     if channel_mention.startswith("<#") and channel_mention.endswith(">"):
                         channel_id = int(channel_mention[2:-1])
-                        channel = ctx.guild.get_channel(channel_id)
                     else:
-                        # Try direct ID
-                        channel = ctx.guild.get_channel(int(channel_mention))
-
+                        channel_id = int(channel_mention)
+                    channel = ctx.guild.get_channel(channel_id)
                     if channel and isinstance(channel, discord.TextChannel):
                         include_channels.append(channel)
                 except (ValueError, TypeError):
                     pass
-
             if not include_channels:
                 return await ctx.send("⚠️ No valid channels found. Use #channel-mentions or channel IDs.")
-
             i += 2
             continue
-
-        # Check for exclude channels flag
         elif args[i].lower() in ("--exclude", "--not"):
             if i + 1 >= len(args):
                 return await ctx.send("⚠️ Please specify channel(s) after --exclude/--not flag.")
-
-            # Extract channel mentions or IDs
             channels_arg = args[i + 1]
             for channel_mention in channels_arg.split(','):
                 channel_mention = channel_mention.strip()
                 try:
-                    # Extract channel ID from mention format <#123456789>
                     if channel_mention.startswith("<#") and channel_mention.endswith(">"):
                         channel_id = int(channel_mention[2:-1])
-                        channel = ctx.guild.get_channel(channel_id)
                     else:
-                        # Try direct ID
-                        channel = ctx.guild.get_channel(int(channel_mention))
-
+                        channel_id = int(channel_mention)
+                    channel = ctx.guild.get_channel(channel_id)
                     if channel and isinstance(channel, discord.TextChannel):
                         exclude_channels.append(channel)
                 except (ValueError, TypeError):
                     pass
-
             if not exclude_channels:
                 return await ctx.send("⚠️ No valid channels found to exclude. Use #channel-mentions or channel IDs.")
-
             i += 2
             continue
-
-        # Keep other arguments
         processed_args.append(args[i])
         i += 1
 
-    # Check for cooldown on deep searches
     if deep_search or custom_query:
         search_stats["deep_searches"] += 1
         guild_id = ctx.guild.id
         current_time = datetime.now()
         if guild_id in search_cooldowns:
             time_diff = (current_time - search_cooldowns[guild_id]).total_seconds()
-            if time_diff < 600:  # 10 minutes cooldown
+            if time_diff < 600:
                 minutes = int((600 - time_diff) // 60)
                 seconds = int((600 - time_diff) % 60)
                 return await ctx.send(f"⚠️ Deep search on cooldown! Try again in {minutes}m {seconds}s.")
 
-    # First argument should be a user mention or ID
     if not processed_args:
-        return await ctx.send(
-            "⚠️ Usage: `!search @user keyword [--a/--all] [--q limit] [--in #channel1,#channel2] [--exclude #channel3]`")
+        return await ctx.send("⚠️ Usage: `!search @user keyword [--a/--all] [--q limit] [--in #channel1,#channel2] [--exclude #channel3]`")
 
+    # In the search_messages command
     try:
-        # Try to extract user from first argument
         user_arg = processed_args[0]
         if user_arg.startswith("<@") and user_arg.endswith(">"):
             user_id = user_arg[2:-1]
@@ -481,59 +465,21 @@ async def search_messages(ctx, *args):
                 user_id = user_id[1:]
         else:
             user_id = user_arg
-
         user = await bot.fetch_user(int(user_id))
-
-        # Rest of args is the keyword
         if len(processed_args) > 1:
             keyword = " ".join(processed_args[1:])
         else:
             return await ctx.send("⚠️ Usage: `!search @user keyword [options]`")
-
     except Exception:
         return await ctx.send("⚠️ Invalid user format. Use @mention or user ID.")
 
-    # Set search operation running state
     search_messages.is_running = True
 
     try:
-        # Prepare search channels
-        search_channels = []
-        if include_channels:
-            search_channels = include_channels
-        else:
-            search_channels = [c for c in ctx.guild.text_channels if c not in exclude_channels]
-
+        search_channels = include_channels if include_channels else [c for c in ctx.guild.text_channels if c not in exclude_channels]
         total_channels = len(search_channels)
-
-        # Post search status message with channel info
-        search_msg_prefix = ""
-        if include_channels:
-            channel_names = ", ".join([f"#{c.name}" for c in include_channels])
-            search_msg_prefix = f"in {channel_names} "
-        elif exclude_channels:
-            channel_names = ", ".join([f"#{c.name}" for c in exclude_channels])
-            search_msg_prefix = f"excluding {channel_names} "
-
-        if deep_search:
-            # Send a different message if user specified a quantity
-            if custom_query:
-                status_msg = await ctx.send(
-                    f"🔍 Deep searching {search_msg_prefix}for up to {query_limit:,} messages from {user.name} containing `{keyword}`. This may take a while...")
-            else:
-                status_msg = await ctx.send(
-                    f"🔍 Deep searching {search_msg_prefix}for all messages from {user.name} containing `{keyword}`. This may take a while...")
-            # Set cooldown timestamp
-            search_cooldowns[ctx.guild.id] = datetime.now()
-        elif custom_query:
-            status_msg = await ctx.send(
-                f"🔍 Searching {search_msg_prefix}for up to {query_limit:,} messages from {user.name} containing `{keyword}`...")
-            # Set cooldown if it's a large query
-            if query_limit > 1000:
-                search_cooldowns[ctx.guild.id] = datetime.now()
-        else:
-            status_msg = await ctx.send(
-                f"🔍 Searching {search_msg_prefix}for recent messages from {user.name} containing `{keyword}`...")
+        search_msg_prefix = f"in {', '.join([f'#{c.name}' for c in include_channels])} " if include_channels else f"excluding {', '.join([f'#{c.name}' for c in exclude_channels])} " if exclude_channels else ""
+        status_msg = await ctx.send(f"🔍 {'Deep ' if deep_search else ''}searching {search_msg_prefix}for messages from {user.name} containing `{keyword}`. This may take a while...")
 
         found_messages = []
         total_searched = 0
@@ -541,140 +487,49 @@ async def search_messages(ctx, *args):
         last_update_time = start_time
         channels_searched = 0
 
-        # Search through the selected channels
         for channel in search_channels:
             channels_searched += 1
-            channel_searched = 0
-
-            # Check if search was cancelled
-            if search_cancelled:
-                await status_msg.edit(
-                    content=f"🛑 Search cancelled after checking {total_searched:,} messages in {channels_searched}/{total_channels} channels.")
-                return
-
-            try:
-                # Get message history with the specified limit
-                async for msg in channel.history(limit=query_limit):
-                    total_searched += 1
-                    channel_searched += 1
-
-                    # Check if search was cancelled (check periodically to avoid overhead)
-                    if search_cancelled and total_searched % 100 == 0:
-                        await status_msg.edit(
-                            content=f"🛑 Search cancelled after checking {total_searched:,} messages in {channels_searched}/{total_channels} channels.")
-                        return
-
-                    # Skip bot messages
-                    if msg.author.bot:
-                        continue
-
-                    # Check for the specific user
-                    if msg.author.id != user.id:
-                        continue
-
-                    # Check keyword match
-                    if keyword.lower() in msg.content.lower():
-                        found_messages.append((msg, channel))
-
-                        # Limit results to prevent Discord message limits
-                        max_results = 15
-                        if len(found_messages) >= max_results:
-                            break
-
-                # Break search if we've reached the limit
+            async for msg in channel.history(limit=query_limit):
+                total_searched += 1
+                if search_cancelled:
+                    await status_msg.edit(content=f"🛑 Search cancelled after checking {total_searched:,} messages in {channels_searched}/{total_channels} channels.")
+                    return
+                if msg.author.bot or msg.author.id != user.id:
+                    continue
+                if keyword.lower() in msg.content.lower():
+                    found_messages.append((msg, channel))
                 if len(found_messages) >= 15:
                     break
-
-                # Update status more frequently for deep searches
                 current_time = datetime.now()
                 time_diff = (current_time - last_update_time).total_seconds()
-
-                # Update status every 3 seconds or every 500 messages, whichever comes first
                 if (deep_search or custom_query) and (time_diff > 3 or total_searched % 500 == 0):
-                    elapsed = (current_time - start_time).total_seconds()
-                    progress_percent = (channels_searched / total_channels) * 100
-
-                    update_msg = (f"🔍 Searching... Checked {total_searched:,} messages "
-                                  f"({channels_searched}/{total_channels} channels, {progress_percent:.1f}%) "
-                                  f"in {elapsed:.1f}s... Found {len(found_messages)} matches so far.")
-
-                    # Add cancellation hint
-                    update_msg += "\n💡 Use `!search cancel` to stop this search."
-
-                    await status_msg.edit(content=update_msg)
+                    await status_msg.edit(content=f"🔍 Searching... Checked {total_searched:,} messages in {channels_searched}/{total_channels} channels. Found {len(found_messages)} matches so far.\n💡 Use `!search cancel` to stop this search.")
                     last_update_time = current_time
 
-            except discord.Forbidden:
-                # Skip channels where we don't have permissions
-                continue
-
-        # Calculate search time
         search_time = (datetime.now() - start_time).total_seconds()
-
         if not found_messages:
-            await status_msg.edit(
-                content=f"❌ No messages found from {user.name} containing '{keyword}'. Searched {total_searched:,} messages in {search_time:.1f}s.")
+            await status_msg.edit(content=f"❌ No messages found from {user.name} containing '{keyword}'. Searched {total_searched:,} messages in {search_time:.1f}s.")
         else:
-            # Format results for Discord message
             result = f"✅ Found {len(found_messages)} messages from {user.name} containing '{keyword}' (searched {total_searched:,} messages in {search_time:.1f}s):\n\n"
-
             for i, (msg, channel) in enumerate(found_messages, 1):
-                # Format timestamp nicely
                 timestamp = msg.created_at.strftime('%Y-%m-%d %H:%M:%S')
-
-                # Format message content (truncate if too long)
-                content = msg.content
-                if len(content) > 500:
-                    content = content[:497] + "..."
-
+                content = msg.content if len(msg.content) <= 500 else f"{msg.content[:497]}..."
                 result += f"{i}. **#{channel.name}** ({timestamp}):\n{content}\n\n"
-
-                # Handle Discord message length limits
                 if len(result) > 1800:
                     result = result[:1800] + "...\n(results truncated due to length)"
                     break
-
             await status_msg.edit(content=result)
-            print(
-                f"Searched {total_searched:,} messages in {ctx.guild.name} in {search_time:.1f}s. Found {len(found_messages)} matches.")
-
     finally:
-        # Calculate search time
         search_time = (datetime.now() - start_time).total_seconds()
-
-        # Update search stats
         search_stats["total_messages_searched"] += total_searched
         search_stats["search_time_total"] += search_time
-
-        # Record if search was cancelled
         if search_cancelled:
             search_stats["cancelled_searches"] += 1
-
-        # Set last search info
-        search_stats["last_search"] = {
-            "user": user.name,
-            "keyword": keyword,
-            "messages": total_searched,
-            "time": search_time,
-            "matches": len(found_messages),
-            "guild": ctx.guild.name
-        }
-
-        # Update match counter
+        search_stats["last_search"] = {"user": user.name, "keyword": keyword, "messages": total_searched, "time": search_time, "matches": len(found_messages), "guild": ctx.guild.name}
         search_stats["total_matches_found"] += len(found_messages)
-
-        # Check if this is the largest search
         if total_searched > search_stats["largest_search"]["messages"]:
-            search_stats["largest_search"] = {
-                "messages": total_searched,
-                "time": search_time,
-                "keyword": keyword,
-                "guild": ctx.guild.name
-            }
-
+            search_stats["largest_search"] = {"messages": total_searched, "time": search_time, "keyword": keyword, "guild": ctx.guild.name}
         save_search_stats()
-
-        # Always reset running state and cancellation flag when finished
         search_messages.is_running = False
         search_cancelled = False
 
@@ -1497,24 +1352,17 @@ async def help_command(ctx):
 
 
 # --- Scheduled tasks ---
-@tasks.loop(seconds=3600)  # Default interval
+@tasks.loop(seconds=3600)
 async def auto_scan():
-    """Periodically scan all guilds for keyword matches"""
     print(f"🔄 Running scheduled auto-scan ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})")
-
-    # Force logging setup refresh to ensure we're using the current date/hour folder
-    global msg_logger, user_logger, msg_log_path, user_log_path
-    msg_logger, user_logger, msg_log_path, user_log_path = setup_logging()
 
     scan_count = 0
     message_count = 0
 
     for guild in bot.guilds:
-        # Get members if needed
         if not guild.chunked:
             await guild.chunk()
 
-        # Scan members
         for member in guild.members:
             name_fields = f"{member.name} {member.display_name}"
             if keyword_match(name_fields):
@@ -1522,21 +1370,16 @@ async def auto_scan():
                 user_logger.info(entry)
                 scan_count += 1
 
-        # Scan recent messages in text channels (if permissions allow)
         for channel in guild.text_channels:
             try:
-                # Get last 100 messages per channel
-                messages = [msg async for msg in channel.history(limit=100)]
-                for msg in messages:
+                async for msg in channel.history(limit=100):
                     if not msg.author.bot and keyword_match(msg.content):
                         entry = f"[AUTO-SCAN] {msg.author} in #{msg.channel} ({msg.guild.name}) > {msg.content}"
                         msg_logger.info(entry)
                         message_count += 1
             except discord.Forbidden:
-                # Skip channels where we don't have permissions
                 continue
 
-    # Calculate next scan time using the interval in seconds
     next_scan_time = datetime.now() + timedelta(seconds=auto_scan.seconds)
     next_scan_str = next_scan_time.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -1673,6 +1516,77 @@ async def clear_logs(ctx, scope: str = "today"):
 
     except Exception as e:
         await ctx.send(f"❌ Error clearing logs: {str(e)}")
+
+
+# --- Utility management commands ---
+@bot.command(name="clearcache")
+async def clear_cache(ctx):
+    """Clear all cached data"""
+    if not is_admin(ctx):
+        return await ctx.send("❌ You must be a server admin to use this.")
+
+    global member_cache, message_cache, user_cache, keyword_match_cache
+
+    member_cache.clear()
+    message_cache.clear()
+    user_cache.clear()
+    keyword_match_cache.clear()
+
+    await ctx.send("✅ All caches cleared successfully.")
+
+
+@bot.command(name="meminfo")
+async def memory_info(ctx):
+    """Show memory usage statistics"""
+    if not is_admin(ctx):
+        return await ctx.send("❌ You must be a server admin to use this.")
+
+    embed = discord.Embed(title="🧠 Memory Usage Statistics", color=0x3498db)
+
+    # Calculate approximate memory usage
+    member_size = sum(sys.getsizeof(v) for v in member_cache.values())
+    message_size = sum(sys.getsizeof(v) for v in message_cache.values())
+    user_size = sum(sys.getsizeof(v) for v in user_cache.values())
+    keyword_size = sys.getsizeof(keyword_match_cache)
+
+    total_cache_size = member_size + message_size + user_size + keyword_size
+
+    embed.add_field(
+        name="Approximate Memory Usage",
+        value=f"Member cache: {member_size / 1024:.1f} KB\n"
+              f"Message cache: {message_size / 1024:.1f} KB\n"
+              f"User cache: {user_size / 1024:.1f} KB\n"
+              f"Keyword cache: {keyword_size / 1024:.1f} KB\n"
+              f"Total: {total_cache_size / 1024:.1f} KB",
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="listcache")
+async def list_cache(ctx):
+    """Display information about currently cached data"""
+    if not is_admin(ctx):
+        return await ctx.send("❌ You must be a server admin to use this.")
+
+    embed = discord.Embed(title="🗂️ Cache Information", color=0x3498db)
+
+    # Member cache information
+    member_cache_text = f"**Guilds cached:** {len(member_cache)}\n"
+    member_cache_text += f"**Total members cached:** {sum(len(members) for members in member_cache.values())}\n"
+    embed.add_field(name="Member Cache", value=member_cache_text, inline=False)
+
+    # Message cache information
+    message_cache_text = f"**Channel entries:** {len(message_cache)}\n"
+    message_cache_text += f"**Total messages cached:** {sum(len(messages) for messages in message_cache.values())}\n"
+    embed.add_field(name="Message Cache", value=message_cache_text, inline=False)
+
+    # User cache information
+    user_cache_text = f"**Users cached:** {len(user_cache)}\n"
+    embed.add_field(name="User Cache", value=user_cache_text, inline=False)
+
+    await ctx.send(embed=embed)
 
 
 try:

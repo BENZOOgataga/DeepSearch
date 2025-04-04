@@ -74,4 +74,4 @@ The bot uses JSON configuration files for persistent settings:
 - psutil
 
 ## License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. Please credit me when using my code, repository (even forks) 🙏

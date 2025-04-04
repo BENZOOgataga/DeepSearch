@@ -3,13 +3,17 @@ import os
 import json
 import asyncio
 import re
+import psutil
 import sys
-from pathlib import Path
+import platform
+import time
 from cachetools import TTLCache
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from datetime import datetime
+import logging
+from logging.handlers import RotatingFileHandler
 
 
 # --- Load env and config ---
@@ -28,9 +32,6 @@ user_log_path = os.path.join(LOGS_DIR, "user_logs.log")
 
 
 def setup_logging():
-    import logging
-    from logging.handlers import RotatingFileHandler
-    from datetime import datetime
 
     # Create date-based directory structure
     current_datetime = datetime.now()
@@ -245,6 +246,7 @@ async def on_ready():
                 user_logger.info(entry)
                 if CONFIG["print_user_matches"]:
                     print(entry)
+        print(f"✅ Scanned {len(guild.members)} members in {guild.name} ({guild.id})")
 
 
 @bot.event
@@ -1535,33 +1537,141 @@ async def clear_cache(ctx):
     await ctx.send("✅ All caches cleared successfully.")
 
 
-@bot.command(name="meminfo")
+@bot.command(name="sysinfo", aliases=["sys", "info", "system", "botinfo", "bot", "sinfo", "si", "bi"])
 async def memory_info(ctx):
-    """Show memory usage statistics"""
+    """Show system and memory usage statistics"""
     if not is_admin(ctx):
         return await ctx.send("❌ You must be a server admin to use this.")
 
-    embed = discord.Embed(title="🧠 Memory Usage Statistics", color=0x3498db)
+    loading_msg = await ctx.send("⏳ Building system information embed, please wait...")
 
-    # Calculate approximate memory usage
-    member_size = sum(sys.getsizeof(v) for v in member_cache.values())
-    message_size = sum(sys.getsizeof(v) for v in message_cache.values())
-    user_size = sum(sys.getsizeof(v) for v in user_cache.values())
-    keyword_size = sys.getsizeof(keyword_match_cache)
+    try:
+        embed = discord.Embed(title="🧠 System Information", color=0x3498db)
+        embed.description = "Here are the current system and memory usage statistics, keep in mind some information might be incorrect:"
 
-    total_cache_size = member_size + message_size + user_size + keyword_size
+        # System information
+        embed.add_field(
+            name="System",
+            value=(f"**OS:** {platform.system()} {platform.release()}\n"
+                   f"**Python:** {platform.python_version()}\n"
+                   f"**Uptime:** {str(timedelta(seconds=int(psutil.boot_time())))}\n"),
+            inline=True
+        )
 
-    embed.add_field(
-        name="Approximate Memory Usage",
-        value=f"Member cache: {member_size / 1024:.1f} KB\n"
-              f"Message cache: {message_size / 1024:.1f} KB\n"
-              f"User cache: {user_size / 1024:.1f} KB\n"
-              f"Keyword cache: {keyword_size / 1024:.1f} KB\n"
-              f"Total: {total_cache_size / 1024:.1f} KB",
-        inline=False
-    )
+        # CPU information
+        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_freq = psutil.cpu_freq()
+        cpu_freq_str = f"{cpu_freq.current:.2f} MHz" if cpu_freq else "N/A"
+        cpu_count = psutil.cpu_count(logical=True)
+        physical_cpu = psutil.cpu_count(logical=False)
 
-    await ctx.send(embed=embed)
+        embed.add_field(
+            name="CPU",
+            value=(f"**Usage:** {cpu_percent}%\n"
+                   f"**Cores:** {physical_cpu} physical / {cpu_count} logical\n"
+                   f"**Frequency:** {cpu_freq_str}"),
+            inline=True
+        )
+
+        # Memory information
+        mem = psutil.virtual_memory()
+        mem_total = mem.total / (1024 * 1024 * 1024)  # Convert to GB
+        mem_used = mem.used / (1024 * 1024 * 1024)    # Convert to GB
+        mem_percent = mem.percent
+
+        embed.add_field(
+            name="Memory",
+            value=(f"**Total:** {mem_total:.2f} GB\n"
+                   f"**Used:** {mem_used:.2f} GB ({mem_percent}%)\n"
+                   f"**Available:** {(mem_total - mem_used):.2f} GB"),
+            inline=True
+        )
+
+        # Disk information
+        disk = psutil.disk_usage('/')
+        disk_total = disk.total / (1024 * 1024 * 1024)  # Convert to GB
+        disk_used = disk.used / (1024 * 1024 * 1024)    # Convert to GB
+        disk_percent = disk.percent
+
+        embed.add_field(
+            name="Disk",
+            value=(f"**Total:** {disk_total:.2f} GB\n"
+                   f"**Used:** {disk_used:.2f} GB ({disk_percent}%)\n"
+                   f"**Free:** {(disk_total - disk_used):.2f} GB"),
+            inline=True
+        )
+
+        # Network information
+        net_io = psutil.net_io_counters()
+        net_sent = net_io.bytes_sent / (1024 * 1024)  # Convert to MB
+        net_recv = net_io.bytes_recv / (1024 * 1024)  # Convert to MB
+
+        embed.add_field(
+            name="Network",
+            value=(f"**Sent:** {net_sent:.2f} MB\n"
+                   f"**Received:** {net_recv:.2f} MB"),
+            inline=True
+        )
+
+        # Process information
+        process = psutil.Process()
+        process_cpu = process.cpu_percent(interval=1)
+        process_mem = process.memory_info().rss / (1024 * 1024)  # Convert to MB
+        process_threads = process.num_threads()
+        process_time = str(timedelta(seconds=int(time.time() - process.create_time())))
+
+        embed.add_field(
+            name="Bot Process",
+            value=(f"**CPU Usage:** {process_cpu}%\n"
+                   f"**Memory Usage:** {process_mem:.2f} MB\n"
+                   f"**Threads:** {process_threads}\n"
+                   f"**Running Time:** {process_time}"),
+            inline=True
+        )
+
+        # Cache statistics
+        embed.add_field(
+            name="Cache Sizes",
+            value=(f"**Member cache:** {len(member_cache)} guilds\n"
+                   f"**Message cache:** {len(message_cache)} channels\n"
+                   f"**User cache:** {len(user_cache)} users\n"
+                   f"**Keyword match cache:** {len(keyword_match_cache)} entries"),
+            inline=True
+        )
+
+        # Calculate approximate memory usage of caches
+        member_size = sum(sys.getsizeof(v) for v in member_cache.values()) / 1024
+        message_size = sum(sys.getsizeof(v) for v in message_cache.values()) / 1024
+        user_size = sum(sys.getsizeof(v) for v in user_cache.values()) / 1024
+        keyword_size = sys.getsizeof(keyword_match_cache) / 1024
+        total_cache_size = member_size + message_size + user_size + keyword_size
+
+        embed.add_field(
+            name="Cache Memory Usage",
+            value=(f"**Member cache:** {member_size:.2f} KB\n"
+                   f"**Message cache:** {message_size:.2f} KB\n"
+                   f"**User cache:** {user_size:.2f} KB\n"
+                   f"**Keyword cache:** {keyword_size:.2f} KB\n"
+                   f"**Total:** {total_cache_size:.2f} KB ({total_cache_size/1024:.2f} MB)"),
+            inline=True
+        )
+
+        # Discord-specific stats
+        discord_ping = round(bot.latency * 1000)
+        embed.add_field(
+            name="Discord",
+            value=(f"**Ping:** {discord_ping}ms\n"
+                   f"**Guilds:** {len(bot.guilds)}\n"
+                   f"**Users:** {len(bot.users)}"),
+            inline=True
+        )
+
+        embed.set_footer(text=f"Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        await loading_msg.edit(content=None, embed=embed)
+
+    except Exception as e:
+        await loading_msg.edit(content=f"❌ Error generating system info: {str(e)}")
 
 
 @bot.command(name="listcache")

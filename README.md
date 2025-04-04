@@ -56,14 +56,14 @@ Table of Contents
 ## Installation
 - Clone the repository: `git clone https://github.com/BENZOOgataga/DeepSearch.git`
 - Install requirements: `pip install -r requirements.txt`
-- Rename the `.env.example` to `.env` and replace `BOT_TOKEN` with your Discord token: `BOT_TOKEN=your_token_here`
+- Rename the [`.env.example`](.env.example) to `.env` and replace `BOT_TOKEN` with your Discord token: `BOT_TOKEN=your_token_here`
   - Note: You can learn how to create a Discord bot [here](BOT_TOKEN_TUTORIAL.md). **Your bot will need message content intent!**
 - Run the bot: `python bot.py`
 
 ## Configuration
 The bot uses JSON configuration files for persistent settings:
 
-- config.json - Bot settings
+- [config.json](config.json) - Bot settings
 - search_stats.json (generated automatically) - Saves search statistics to keep them after a bot restart
 
 ## Requirements

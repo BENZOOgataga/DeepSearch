@@ -1,73 +1,93 @@
-import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import platform
+import queue
 import re
+import shutil
 import sys
-import time
 from datetime import datetime
 from datetime import timedelta
 
-import aiofiles
 import discord
 import psutil
 from cachetools import TTLCache
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from utils.search_utils import process_search_channels, update_search_status, update_search_stats
-from utils.command_utils import setup_command_execution, handle_cancel_request, apply_cooldown
+
 from utils.cache_utils import get_cache_stats
+from utils.command_utils import setup_command_execution, handle_cancel_request, apply_cooldown
+from utils.search_utils import process_search_channels, update_search_status, update_search_stats
 
 
-# --- Custom RotatingFileHandler for async ---
-class AsyncLogHandler(logging.Handler):
-    def __init__(self, filename, mode='a', encoding='utf-8'):
-        super().__init__()
-        self.filename = filename
-        self.mode = mode
-        self.encoding = encoding
-        self.queue = asyncio.Queue()
-        self.task = None
-        self.loop = None
+# --- Environment check ---
+def check_environment():
+    """Check the runtime environment and return any warnings."""
+    warnings = []
 
-    async def start(self):
-        self.loop = asyncio.get_running_loop()
-        self.task = asyncio.create_task(self._worker())
+    # Check Python version
+    python_version = tuple(map(int, platform.python_version_tuple()))
+    if python_version < (3, 8):
+        raise Exception("DeepSearch requires Python 3.8 or higher to work because it uses the Discord.py library. Please update your Python version.")
 
-    async def stop(self):
-        if self.task:
-            self.queue.put_nowait(None)
-            await self.task
-            self.task = None
+    # Check if running in IDE first (takes precedence over venv detection)
+    in_ide = any(ide in os.environ.get('PYTHONPATH', '').lower() for ide in ['pycharm', 'vscode', 'eclipse', 'intellij', 'idle']) or \
+             'PYCHARM_HOSTED' in os.environ or 'VSCODE_CLI' in os.environ or 'VSCODE_CWD' in os.environ or \
+             'SPYDER' in os.environ or 'JUPYTER' in os.environ or 'IDLE' in os.environ
 
-    async def _worker(self):
-        while True:
-            record = await self.queue.get()
-            if record is None:
-                break
+    # Define environments to check with custom messages
+    env_checks = {
+        "Docker": (os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"),
+                   "Running in Docker container"),
+        "Pterodactyl": (os.environ.get("P_SERVER_LOCATION") is not None or
+                        os.path.exists("/etc/pterodactyl") or
+                        "pterodactyl" in os.environ.get("HOSTNAME", "").lower(),
+                        "Running in Pterodactyl environment"),
+        "Virtual Environment": (not in_ide and  # Only report venv if not in IDE
+                                (hasattr(sys, 'real_prefix') or
+                                 (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)),
+                                "Running in a virtual environment"),
+        "IDE": (in_ide, "Running in an IDE environment"),
+        "Raspberry Pi": (platform.system() == 'Linux' and 'arm' in platform.machine().lower(),
+                         "Running on Raspberry Pi. Performance may be limited"),
+        "Low Memory": (psutil.virtual_memory().total < 2 * 1024 * 1024 * 1024,
+                       "Less than 2GB of RAM detected. Performance may be affected"),
+        "Headless System": (os.environ.get('DISPLAY', '') == '', None)  # Don't warn about headless
+    }
 
-            try:
-                async with aiofiles.open(self.filename, self.mode, encoding=self.encoding) as f:
-                    await f.write(self.format(record) + '\n')
-            except Exception:
-                self.handleError(record)
+    # Add warnings for detected environments that need caution
+    for env_type, (detected, message) in env_checks.items():
+        if detected and message:  # Only add warning if there's a message to display
+            warnings.append(message)
 
-    def emit(self, record):
-        if self.loop is None or self.task is None:
-            # Fall back to synchronous if not started
-            try:
-                with open(self.filename, self.mode, encoding=self.encoding) as f:
-                    f.write(self.format(record) + '\n')
-            except Exception:
-                self.handleError(record)
-            return
-
-        # Put record in queue for async processing
+    # Check internet connection (only on posix systems)
+    if os.name == 'posix':
         try:
-            self.queue.put_nowait(record)
-        except Exception:
-            self.handleError(record)
+            import subprocess
+            subprocess.run(
+                ["ping", "-c", "1", "8.8.8.8"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2  # Add timeout to prevent hanging
+            )
+        except (subprocess.SubprocessError, FileNotFoundError):
+            warnings.append("No internet connection detected. DeepSearch cannot connect to Discord.")
+            exit()  # Exit if no internet connection
+
+    return warnings
+
+# Display environment warnings
+print("🔍 Environment Check:")
+warnings = check_environment()
+if warnings:
+    print("⚠️ Notices:")
+    for warning in warnings:
+        print(f"  • {warning}")
+else:
+    print("✅ All environment checks passed")
+
 
 # --- Load env and config ---
 load_dotenv()
@@ -94,14 +114,26 @@ def setup_logging():
     msg_log_path = os.path.join(date_hour_dir, "message_logs.log")
     user_log_path = os.path.join(date_hour_dir, "user_logs.log")
 
-    # Configure async log handlers
-    msg_handler = AsyncLogHandler(msg_log_path, mode='a', encoding='utf-8')
-    user_handler = AsyncLogHandler(user_log_path, mode='a', encoding='utf-8')
+    # Set up logging with queue handlers for thread safety
+    log_queue = queue.Queue(-1)  # No limit on queue size
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+
+    # Configure root logger to use the queue
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    for handler in root_logger.handlers[:]:  # Remove any existing handlers
+        root_logger.removeHandler(handler)
+    root_logger.addHandler(queue_handler)
+
+    # Configure file handlers for the listener
+    msg_handler = logging.FileHandler(msg_log_path, mode='a', encoding='utf-8')
+    user_handler = logging.FileHandler(user_log_path, mode='a', encoding='utf-8')
 
     formatter = logging.Formatter('%(asctime)s - %(message)s')
     msg_handler.setFormatter(formatter)
     user_handler.setFormatter(formatter)
 
+    # Create and configure loggers
     msg_logger = logging.getLogger('message_log')
     user_logger = logging.getLogger('user_log')
 
@@ -111,18 +143,14 @@ def setup_logging():
     msg_logger.propagate = False
     user_logger.propagate = False
 
-    # Clear any existing handlers
-    if msg_logger.handlers:
-        for handler in msg_logger.handlers:
-            msg_logger.removeHandler(handler)
-    if user_logger.handlers:
-        for handler in user_logger.handlers:
-            user_logger.removeHandler(handler)
-
     msg_logger.addHandler(msg_handler)
     user_logger.addHandler(user_handler)
 
-    return msg_logger, user_logger, msg_log_path, user_log_path
+    # Set up the queue listener
+    listener = logging.handlers.QueueListener(log_queue, msg_handler, user_handler)
+    listener.start()
+
+    return msg_logger, user_logger, msg_log_path, user_log_path, listener
 
 
 # --- Init bot ---
@@ -131,7 +159,7 @@ intents.members = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-msg_logger, user_logger, msg_log_path, user_log_path = setup_logging()
+msg_logger, user_logger, msg_log_path, user_log_path, log_listener = setup_logging()
 
 # --- Caches ---
 member_cache = TTLCache(maxsize=500, ttl=3600)  # Cache for 1 hour, store up to 500 guilds
@@ -331,9 +359,6 @@ def parse_command_args(args):
 # --- Events ---
 @bot.event
 async def on_ready():
-    for handler in msg_logger.handlers + user_logger.handlers:
-        if isinstance(handler, AsyncLogHandler):
-            await handler.start()
     print(f"✅ Logged in as {bot.user}")
     print("🔍 Keywords:", ', '.join(CONFIG["search_keywords"]))
     print(f"📁 Logs at {os.path.dirname(msg_log_path)}")
@@ -1681,75 +1706,37 @@ async def set_scan_interval(ctx, minutes: str):
         await ctx.send("⚠️ Please provide a valid number for the interval")
 
 
-@bot.command(name="clearlogs")
+@bot.command(name="clearlogs", aliases=["clearlog", "cl", "logclear", "logsclear"])
 async def clear_logs(ctx, scope: str = "today"):
     """Clear logs based on scope (today/all)"""
     if not is_admin(ctx):
         return await ctx.send("❌ You must be a server admin to use this.")
 
     try:
-        global msg_logger, user_logger, msg_log_path, user_log_path
+        global msg_logger, user_logger, msg_log_path, user_log_path, log_listener
+
+        # Stop the current listener
+        log_listener.stop()
 
         if scope.lower() == "today":
-            # Get current date folder
-            current_date = datetime.now().strftime('%Y-%m-%d')
-            # Find all folders matching today's date
-            today_folders = [folder for folder in os.listdir(LOGS_DIR)
-                             if folder.startswith(current_date)]
-
-            if not today_folders:
-                return await ctx.send("ℹ️ No logs found for today.")
-
-            count = 0
-            for folder in today_folders:
-                folder_path = os.path.join(LOGS_DIR, folder)
-                if os.path.isdir(folder_path):
-                    for file in os.listdir(folder_path):
-                        os.remove(os.path.join(folder_path, file))
-                        count += 1
-                    os.rmdir(folder_path)
-
-            # Refresh logging to ensure we're using a new folder
-            msg_logger, user_logger, msg_log_path, user_log_path = setup_logging()
-
-            await ctx.send(f"✅ Cleared {count} log files from today's folders.")
+            # Clear today's logs
+            with open(msg_log_path, 'w', encoding='utf-8') as f:
+                pass
+            with open(user_log_path, 'w', encoding='utf-8') as f:
+                pass
+            await ctx.send("✅ Today's logs cleared successfully.")
 
         elif scope.lower() == "all":
-            # Confirm deletion with reaction
-            confirm_msg = await ctx.send("⚠️ Are you sure you want to delete ALL logs? React with ✅ to confirm.")
-            await confirm_msg.add_reaction("✅")
-
-            def check(reaction, user):
-                return user == ctx.author and str(reaction.emoji) == "✅" and reaction.message.id == confirm_msg.id
-
-            try:
-                # Wait for confirmation
-                await bot.wait_for('reaction_add', timeout=30.0, check=check)
-
-                # Delete all log folders
-                count = 0
-                for item in os.listdir(LOGS_DIR):
-                    item_path = os.path.join(LOGS_DIR, item)
-                    if os.path.isdir(item_path):
-                        for file in os.listdir(item_path):
-                            os.remove(os.path.join(item_path, file))
-                            count += 1
-                        os.rmdir(item_path)
-
-                # Refresh logging
-                msg_logger, user_logger, msg_log_path, user_log_path = setup_logging()
-
-                await ctx.send(f"✅ Cleared {count} log files from all folders.")
-
-            except asyncio.TimeoutError:
-                await ctx.send("❌ Confirmation timed out. Logs were not deleted.")
-                try:
-                    await confirm_msg.delete()
-                except:
-                    pass
+            # Delete all log directories and files
+            shutil.rmtree(LOGS_DIR)
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            await ctx.send("✅ All logs cleared successfully.")
 
         else:
-            await ctx.send("⚠️ Invalid option. Use 'today' or 'all'.")
+            await ctx.send("⚠️ Invalid scope. Use 'today' or 'all'.")
+
+        # Re-initialize logging
+        msg_logger, user_logger, msg_log_path, user_log_path, log_listener = setup_logging()
 
     except Exception as e:
         await ctx.send(f"❌ Error clearing logs: {str(e)}")
@@ -1801,7 +1788,8 @@ async def memory_info(ctx):
             name="System",
             value=(f"**OS:** {platform.system()} {platform.release()}\n"
                    f"**Python:** {platform.python_version()}\n"
-                   f"**Uptime:** {str(timedelta(seconds=int(psutil.boot_time())))}\n"),
+                   f"**discord.py:** {discord.__version__}\n"
+                   f"**Process ID:** {os.getpid()}"),
             inline=False
         )
 
@@ -1810,7 +1798,7 @@ async def memory_info(ctx):
             name="Discord",
             value=(f"**API Latency:** {round(bot.latency * 1000)}ms\n"
                    f"**Guilds:** {len(bot.guilds)}\n"
-                   f"**Users:** {sum(len(guild.members) for guild in bot.guilds)}\n"),
+                   f"**Users Available:** {sum(g.member_count for g in bot.guilds):,}"),
             inline=True
         )
 
@@ -1818,8 +1806,8 @@ async def memory_info(ctx):
         embed.add_field(
             name="Memory",
             value=(f"**Bot Usage:** {memory_usage:.2f} MB\n"
-                   f"**System:** {system_memory.percent}% used\n"
-                   f"**Available:** {system_memory.available / 1024 / 1024 / 1024:.2f} GB free"),
+                   f"**System Free:** {system_memory.available/1024/1024:.2f} MB\n"
+                   f"**System Total:** {system_memory.total/1024/1024:.2f} MB"),
             inline=True
         )
 
@@ -1827,8 +1815,8 @@ async def memory_info(ctx):
         embed.add_field(
             name="Cache Statistics",
             value=(f"**Members:** {cache_stats['member_count']:,} in {cache_stats['member_guilds']} guilds\n"
-                   f"**Messages:** {cache_stats['message_count']:,} in {cache_stats['message_entries']} channels\n"
-                   f"**Users:** {cache_stats['user_count']:,} cached\n"
+                   f"**Messages:** {cache_stats['message_count']:,} across {cache_stats['message_entries']} channels\n"
+                   f"**Users:** {cache_stats['user_count']:,}\n"
                    f"**Keyword Matches:** {cache_stats['keyword_matches']:,}"),
             inline=False
         )
@@ -1840,7 +1828,7 @@ async def memory_info(ctx):
                    f"**Message Cache:** {cache_stats['sizes']['message_size']:.2f} KB\n"
                    f"**User Cache:** {cache_stats['sizes']['user_size']:.2f} KB\n"
                    f"**Keyword Cache:** {cache_stats['sizes']['keyword_size']:.2f} KB\n"
-                   f"**Total:** {cache_stats['sizes']['total_size']:.2f} KB"),
+                   f"**Total Cache Size:** {cache_stats['sizes']['total_size']:.2f} KB"),
             inline=True
         )
 
@@ -1860,7 +1848,7 @@ async def memory_info(ctx):
         embed.add_field(
             name="Auto-Scan Status",
             value=(f"**Status:** {auto_scan_status}\n"
-                   f"**Interval:** {format_time_interval(auto_scan_interval)}"),
+                   f"**Interval:** {format_time_interval(auto_scan_interval)}\n"),
             inline=False
         )
 

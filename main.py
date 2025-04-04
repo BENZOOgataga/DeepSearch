@@ -346,6 +346,8 @@ def parse_command_args(args):
         # Handle boolean flags
         elif arg in ("--all", "-a"):
             flags["deep_search"] = True
+        if "--debug" in args or "-d" in args:
+            flags["debug"] = True
         elif arg in ("--users", "-u"):
             flags["scan_users"] = True
         elif arg in ("--messages", "-m"):
@@ -356,6 +358,13 @@ def parse_command_args(args):
         i += 1
 
     return processed_args, flags
+
+
+def debug_print(message, debug_enabled=False):
+    """Print debug messages if debug mode is enabled"""
+    if debug_enabled:
+        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+        print(f"[DEBUG {timestamp}] {message}")
 
 
 # --- Events ---
@@ -1807,6 +1816,9 @@ async def scan_bad_words(ctx, *args):
 
     search_cancelled = False
 
+    # Extract debug mode from config or flags
+    debug_mode = CONFIG.get("debug_mode", False) or "--debug" in args or "-d" in args
+
     # Extract flags with default values
     query_limit = int(flags.get("query_limit", 500))  # Default limit
 
@@ -2006,7 +2018,16 @@ async def scan_bad_words(ctx, *args):
 
                     total_messages += 1
 
-                    # Check if message contains bad words according to strictness
+                    # Add debug info for message processing
+                    debug_print(f"Reading message from {message.author.name} in #{channel.name}", debug_mode)
+
+                    # Performance tracking
+                    if total_messages % 100 == 0 and debug_mode:
+                        elapsed = (datetime.now() - start_time).total_seconds()
+                        messages_per_second = total_messages / elapsed if elapsed > 0 else 0
+                        debug_print(f"Speed: {messages_per_second:.1f} messages/sec - Total: {total_messages:,}", debug_mode)
+
+                # Check if message contains bad words according to strictness
                     if text_contains_bad_word(message.content, strictness):
                         # Format the message for display
                         content = message.content
@@ -2107,7 +2128,7 @@ async def scan_bad_words(ctx, *args):
 @bot.command(name="debug")
 async def toggle_debug(ctx, state: str = None):
     if not is_admin(ctx):
-        return await ctx.send("❌ You must be a server admin to use this.")
+        pass
 
     global CONFIG
 

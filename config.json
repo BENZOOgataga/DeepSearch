@@ -1,5 +1,11 @@
 {
-    "search_keywords": ["test", "test2"],
-    "print_user_matches": false,
-    "print_message_matches": false
+  "search_keywords": [
+    "BENZOOgataga",
+    "test",
+    "super"
+  ],
+  "print_user_matches": false,
+  "print_message_matches": false,
+  "auto_scan_enabled": false,
+  "auto_scan_interval_minutes": 60.0
 }

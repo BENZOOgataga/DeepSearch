@@ -57,7 +57,7 @@ Table of Contents
 - Clone the repository: `git clone https://github.com/BENZOOgataga/DeepSearch.git`
 - Install requirements: `pip install -r requirements.txt`
 - Rename the `.env.example` to `.env` and replace `BOT_TOKEN` with your Discord token: `BOT_TOKEN=your_token_here`
-  - Note: You can learn how to create a Discord bot [here](BOT_TOKEN_TUTORIAL.md).
+  - Note: You can learn how to create a Discord bot [here](BOT_TOKEN_TUTORIAL.md). **Your bot will need message content intent!**
 - Run the bot: `python bot.py`
 
 ## Configuration

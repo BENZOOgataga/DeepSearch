@@ -647,6 +647,9 @@ search_cancelled = False
 
 @bot.command(name="search")
 async def search_messages(ctx, *args):
+    if not is_admin(ctx):
+        return await ctx.send("❌ You must be a server admin to use this.")
+
     global search_cancelled, search_cooldowns
 
     # Handle cancel request
@@ -657,9 +660,6 @@ async def search_messages(ctx, *args):
             return await ctx.send("⚠️ Search cancelled.")
         else:
             return await ctx.send("⚠️ No search is currently running.")
-
-    if not is_admin(ctx):
-        return await ctx.send("❌ You must be a server admin to use this.")
 
     # Setup command execution
     if not setup_command_execution(search_messages):
@@ -2082,9 +2082,9 @@ async def scan_bad_words(ctx, *args):
                 matched_word_list = ", ".join([f"`{word}`" for word in match['matched_words']])
 
                 results_text += f"[{i+1}] **{match['author']}** in #{match['channel_name']}:\n"
-                results_text += f"{match['content']}\n"
-                results_text += f"⚠️ **Bad words detected:** {matched_word_list}\n"
-                results_text += f"[Jump to message]({match['jump_url']})\n\n"
+                results_text += f"↳ ⁠{match['content']}\n"
+                results_text += f"↳ ⁠**Bad words detected:** {matched_word_list}\n"
+                results_text += f"↳ ⁠[Jump to message]({match['jump_url']})\n\n"
 
             if len(found_messages) > 15:
                 results_text += f"*...and {len(found_messages) - 15} more messages*"
@@ -2104,6 +2104,28 @@ async def scan_bad_words(ctx, *args):
 
 
 # --- Utility Commands ---
+@bot.command(name="debug")
+async def toggle_debug(ctx, state: str = None):
+    if not is_admin(ctx):
+        return await ctx.send("❌ You must be a server admin to use this.")
+
+    global CONFIG
+
+    if state is None:
+        current_state = CONFIG.get("debug_mode", False)
+        return await ctx.send(f"🛠️ Debug mode is currently {'enabled' if current_state else 'disabled'}")
+
+    if state.lower() in ("on", "true", "yes", "1"):
+        CONFIG["debug_mode"] = True
+        save_config()
+        await ctx.send("🛠️ Debug mode enabled - performance data will be printed to console")
+    elif state.lower() in ("off", "false", "no", "0"):
+        CONFIG["debug_mode"] = False
+        save_config()
+        await ctx.send("🛠️ Debug mode disabled")
+    else:
+        await ctx.send("⚠️ Use 'on' or 'off'")
+
 @bot.command(name="clearcache")
 async def clear_cache(ctx):
     """Clear all cached data"""

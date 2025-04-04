@@ -16,7 +16,7 @@ from cachetools import TTLCache
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from utils.cache_utils import get_cache_stats
+from utils.cache_utils import get_cache_stats, load_bad_words
 from utils.command_utils import setup_command_execution, handle_cancel_request, apply_cooldown
 from utils.search_utils import process_search_channels, update_search_status, update_search_stats
 
@@ -160,6 +160,8 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 msg_logger, user_logger, msg_log_path, user_log_path, log_listener = setup_logging()
+
+BAD_WORDS = load_bad_words()
 
 # --- Caches ---
 member_cache = TTLCache(maxsize=500, ttl=3600)  # Cache for 1 hour, store up to 500 guilds
@@ -364,30 +366,37 @@ async def on_ready():
     print(f"📁 Logs at {os.path.dirname(msg_log_path)}")
 
     update_scheduled_tasks()
-    print()
 
     # Track message matches for initial scan
     initial_message_matches = 0
     initial_member_matches = 0
+    total_members_scanned = 0
+    total_messages_scanned = 0
+    guild_count = len(bot.guilds)
+
+    print(f"\n🔎 Starting initial scan across {guild_count} guilds...")
 
     for guild in bot.guilds:
-        print(f"🔍 Scanning guild: {guild.name} ({guild.id})")
         # Chunk only if necessary
         if not guild.chunked:
             await guild.chunk(cache=True)
 
         # Scan members
+        member_count = len(guild.members)
+        total_members_scanned += member_count
+
+        member_matches = 0
         for member in get_cached_members(guild.id):
             name_fields = f"{member.name} {member.display_name}"
             if keyword_match(name_fields):
                 initial_member_matches += 1
+                member_matches += 1
                 entry = f"[AUTO] {member} ({member.id}) in {guild.name}"
                 user_logger.info(entry)
                 if CONFIG["print_user_matches"]:
                     print(entry)
 
-        # Initial scan of 5000 messages
-        print(f"🔍 Scanning 5k messages in {guild.name}...")
+        # Initial scan of messages
         message_scan_count = 0
         channels = [c for c in guild.text_channels if c.permissions_for(guild.me).read_messages]
 
@@ -405,14 +414,13 @@ async def on_ready():
                             msg_logger.info(entry)
                             if CONFIG["print_message_matches"]:
                                 print(entry)
-                except discord.Forbidden:
+                except (discord.Forbidden, Exception):
                     continue
-                except Exception as e:
-                    print(f"Error scanning {channel.name}: {e}")
 
-        print(f"✅ Scanned {len(guild.members)} members and {message_scan_count} messages in {guild.name}")
+        total_messages_scanned += message_scan_count
+        print(f"  • {guild.name}: {member_matches}/{member_count} members, {message_scan_count} messages scanned")
 
-    print(f"✅ Initial scan complete! Found {initial_member_matches} matching members and {initial_message_matches} matching messages.")
+    print(f"\n✅ Initial scan complete! Found {initial_member_matches}/{total_members_scanned} matching members and {initial_message_matches}/{total_messages_scanned} matching messages.")
 
 
 @bot.event
@@ -427,7 +435,7 @@ async def on_message(msg):
     await bot.process_commands(msg)
 
 
-# --- Commands ---
+# --- Commands Section---
 @bot.command(name="setkeywords")
 async def set_keywords(ctx, *, words):
     if not is_admin(ctx):
@@ -1599,6 +1607,13 @@ async def help_command(ctx):
                           "• `--in #channel1,#channel2` to search only specific channels\n"
                           "• `--exclude #channel3,#channel4` to skip specific channels", inline=False)
     embed.add_field(name="!search cancel", value="Cancel a running search operation", inline=False)
+    embed.add_field(name="!badscan [options]",
+                    value="Scan for bad words with options:\n"
+                          "--user @mention: Only check specific user\n"
+                          "--strictness low/medium/high: Detection sensitivity\n"
+                          "--list : sample list of bad words\n"
+                          "--in/--exclude: Channel filtering",
+                    inline=False)
     embed.add_field(name="!searchstats", value="Display statistics about searches performed", inline=False)
     embed.add_field(name="!regex @user pattern [options]",
                     value="Search using regex patterns with the same options as !search", inline=False)
@@ -1742,7 +1757,407 @@ async def clear_logs(ctx, scope: str = "today"):
         await ctx.send(f"❌ Error clearing logs: {str(e)}")
 
 
-# --- Utility management commands ---
+@bot.command(name="badscan", aliases=["scanwords", "wordscan", "badwords"])
+async def scan_bad_words(ctx, *args):
+    """Scan for messages containing bad words including obfuscated variants"""
+    if not is_admin(ctx):
+        return await ctx.send("❌ You must be a server admin to use this.")
+
+    global search_cancelled
+
+    # Parse arguments first - before any other processing
+    processed_args, flags = parse_command_args(args)
+
+    # Check for list flag - handle it immediately
+    if "--list" in args or "-l" in args or any(arg == "list" for arg in processed_args):
+        if not BAD_WORDS:
+            return await ctx.send("⚠️ Bad words list is empty. Check if the file exists at `utils/badwords_en.txt`.")
+
+        word_sample = sorted(list(BAD_WORDS))[:50]
+        sample_text = ", ".join(word_sample)
+        return await ctx.send(f"📋 **Bad words list sample** (showing 50 of {len(BAD_WORDS)} words):\n```{sample_text}...```")
+
+    # Handle cancel request
+    if "cancel" in processed_args:
+        if hasattr(scan_bad_words, "is_running") and scan_bad_words.is_running:
+            scan_bad_words.is_running = False
+            search_cancelled = True
+            return await ctx.send("🛑 Cancelling bad words scan...")
+        else:
+            return await ctx.send("ℹ️ No bad words scan running.")
+
+    # Setup command execution
+    if not setup_command_execution(scan_bad_words):
+        return await ctx.send("⚠️ A bad words scan is already running. Use `!badscan cancel` to stop it.")
+
+    search_cancelled = False
+
+    # Extract flags with default values
+    query_limit = int(flags.get("query_limit", 500))  # Default limit
+
+    # Handle channel filters directly from args to ensure proper parsing
+    include_channels = []
+
+    # Process --in flag for channels
+    for i, arg in enumerate(args):
+        if arg == "--in" and i + 1 < len(args):
+            channel_input = args[i + 1]
+            # Handle channel mention format <#123456789>
+            if channel_input.startswith('<#') and channel_input.endswith('>'):
+                channel_id = int(channel_input[2:-1])
+                channel = ctx.guild.get_channel(channel_id)
+                if channel and isinstance(channel, discord.TextChannel):
+                    include_channels.append(channel)
+                else:
+                    include_channels.append(channel_input.strip('#'))
+            else:
+                include_channels.append(channel_input.strip('#'))
+        elif arg.startswith("--in="):
+            channel_input = arg.split("=")[1]
+            # Handle channel mention format <#123456789>
+            if channel_input.startswith('<#') and channel_input.endswith('>'):
+                channel_id = int(channel_input[2:-1])
+                channel = ctx.guild.get_channel(channel_id)
+                if channel and isinstance(channel, discord.TextChannel):
+                    include_channels.append(channel)
+                else:
+                    include_channels.append(channel_input.strip('#'))
+            else:
+                include_channels.append(channel_input.strip('#'))
+
+    # Process strictness flag
+    strictness = "medium"  # default
+    for i, arg in enumerate(args):
+        if arg.startswith("--strictness="):
+            strictness = arg.split("=")[1].lower()
+        elif arg == "--strictness" and i + 1 < len(args):
+            if not args[i + 1].startswith("--"):
+                strictness = args[i + 1].lower()
+
+    # Process language flag
+    lang = "en"  # default
+    for i, arg in enumerate(args):
+        if arg.startswith("--lang="):
+            lang = arg.split("=")[1].lower()
+        elif arg == "--lang" and i + 1 < len(args):
+            if not args[i + 1].startswith("--"):
+                lang = args[i + 1].lower()
+
+    # Validate strictness level
+    if strictness not in ["low", "medium", "high"]:
+        strictness = "medium"
+        await ctx.send("⚠️ Invalid strictness level. Using 'medium' instead. Valid options: low, medium, high")
+
+    # Load language-specific bad words
+    bad_words_path = f"utils/badwords_{lang}.txt"
+    if lang != "en" or not BAD_WORDS:
+        try:
+            bad_words = set()
+            with open(bad_words_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    word = line.strip()
+                    if word:  # Skip empty lines
+                        bad_words.add(word.lower())
+            if not bad_words:
+                return await ctx.send(f"⚠️ Bad words list is empty for language '{lang}'. Check if the file exists at `{bad_words_path}`.")
+        except FileNotFoundError:
+            return await ctx.send(f"⚠️ Bad words file not found for language '{lang}'. Check if `{bad_words_path}` exists.")
+        except Exception as e:
+            return await ctx.send(f"⚠️ Error loading bad words list: {e}")
+    else:
+        bad_words = BAD_WORDS
+
+    # Verify bad words list is loaded
+    if not bad_words:
+        return await ctx.send(f"⚠️ Bad words list is empty for language '{lang}'. Check if the file exists at `{bad_words_path}`.")
+
+    # Process target user if provided
+    user = None
+    for i, arg in enumerate(args):
+        if arg.startswith("--user="):
+            user_input = arg.split("=")[1].strip()
+            # Handle user mention format
+            if user_input.startswith("<@") and user_input.endswith(">"):
+                # Strip <@ and > from the mention to get the ID
+                user_id = user_input.replace("<@", "").replace(">", "").replace("!", "")
+                try:
+                    user = await bot.fetch_user(int(user_id))
+                except discord.NotFound:
+                    return await ctx.send(f"⚠️ User with ID {user_id} not found.")
+                except ValueError:
+                    return await ctx.send(f"⚠️ Invalid user mention format: {user_input}")
+            else:
+                try:
+                    # Try to get by ID directly
+                    user_id = int(user_input)
+                    user = await bot.fetch_user(user_id)
+                except ValueError:
+                    # If not an ID, search by name
+                    members = ctx.guild.members
+                    found = discord.utils.find(lambda m: m.name.lower() == user_input.lower(), members)
+                    if found:
+                        user = found
+                    else:
+                        return await ctx.send(f"⚠️ User '{user_input}' not found.")
+                except discord.NotFound:
+                    return await ctx.send(f"⚠️ User with ID {user_input} not found.")
+        elif arg == "--user" and i + 1 < len(args):
+            user_input = args[i + 1]
+            # Skip if next arg is another flag
+            if user_input.startswith('--'):
+                continue
+
+            # Handle user mention format
+            if user_input.startswith("<@") and user_input.endswith(">"):
+                # Strip <@ and > from the mention to get the ID
+                user_id = user_input.replace("<@", "").replace(">", "").replace("!", "")
+                try:
+                    user = await bot.fetch_user(int(user_id))
+                except discord.NotFound:
+                    return await ctx.send(f"⚠️ User with ID {user_id} not found.")
+                except ValueError:
+                    return await ctx.send(f"⚠️ Invalid user mention format: {user_input}")
+            else:
+                try:
+                    # Try to get by ID directly
+                    user_id = int(user_input)
+                    user = await bot.fetch_user(user_id)
+                except ValueError:
+                    # If not an ID, search by name
+                    members = ctx.guild.members
+                    found = discord.utils.find(lambda m: m.name.lower() == user_input.lower(), members)
+                    if found:
+                        user = found
+                    else:
+                        return await ctx.send(f"⚠️ User '{user_input}' not found.")
+                except discord.NotFound:
+                    return await ctx.send(f"⚠️ User with ID {user_input} not found.")
+
+    # Prepare search channels
+    search_channels = []
+    channel_names_to_find = []
+
+    if include_channels:
+        for ch_item in include_channels:
+            # If the item is already a channel object, add it directly
+            if isinstance(ch_item, discord.TextChannel):
+                search_channels.append(ch_item)
+            # Otherwise, try to find the channel by name
+            else:
+                channel_names_to_find.append(ch_item)
+
+        # Process any channel names that need to be looked up
+        if channel_names_to_find:
+            for ch_name in channel_names_to_find:
+                channel = discord.utils.get(ctx.guild.text_channels, name=ch_name)
+                if channel and channel.permissions_for(ctx.guild.me).read_messages:
+                    search_channels.append(channel)
+
+        if not search_channels:
+            scan_bad_words.is_running = False
+            named_channels = ", ".join([f"<#{ch}>" if ch.isdigit() else f"#{ch}" for ch in channel_names_to_find])
+            return await ctx.send(f"⚠️ None of the specified channels were found or accessible. Looking for: {named_channels}")
+    else:
+        search_channels = [ch for ch in ctx.guild.text_channels
+                           if ch.permissions_for(ctx.guild.me).read_messages]
+
+    if not search_channels:
+        scan_bad_words.is_running = False
+        return await ctx.send("⚠️ No channels to search.")
+
+    # Status message
+    user_filter = f" from {user.name}" if user else ""
+    channel_filter = ""
+    if include_channels:
+        channel_names = [f"#{ch.name}" for ch in search_channels]
+        channel_filter = f" in {', '.join(channel_names)}"
+
+    status_msg = await ctx.send(f"🔍 Scanning for messages containing bad words{user_filter}{channel_filter} with {strictness} detection ({lang} language, limit: {query_limit})...")
+
+    try:
+        # Define character substitutions based on strictness
+        substitutions = {
+            "a": ["4", "@", "α"],
+            "b": ["8", "6"],
+            "c": ["(", "k", "s"],
+            "e": ["3", "€"],
+            "i": ["1", "!", "|"],
+            "l": ["1", "!", "|"],
+            "o": ["0", "()"],
+            "s": ["5", "$", "z"],
+            "t": ["7", "+"],
+            "u": ["v"],
+            "v": ["u"],
+            "g": ["9", "6"],
+            "z": ["s", "2"]
+        }
+
+        # Search for bad words
+        found_messages = []
+        total_searched = 0
+        start_time = datetime.now()
+        last_update_time = start_time
+        channels_searched = 0
+
+        for channel in search_channels:
+            if search_cancelled:
+                break
+
+            channels_searched += 1
+
+            try:
+                async for message in channel.history(limit=query_limit):
+                    # Skip the bot's own messages
+                    if message.author.id == bot.user.id:
+                        continue
+
+                    # Skip messages not from the target user if specified
+                    if user and message.author.id != user.id:
+                        continue
+
+                    total_searched += 1
+
+                    # Check if the message contains any bad words
+                    content_lower = message.content.lower()
+
+                    # Apply strictness levels
+                    if strictness == "low":
+                        # Basic matching
+                        if any(f" {word} " in f" {content_lower} " for word in bad_words):
+                            found_messages.append(message)
+
+                    elif strictness == "medium":
+                        # Basic + some obfuscation detection
+                        for word in bad_words:
+                            if f" {word} " in f" {content_lower} ":
+                                found_messages.append(message)
+                                break
+
+                            # Check for simple letter substitutions (medium strictness)
+                            processed_content = content_lower
+                            for char, replacements in substitutions.items():
+                                for replacement in replacements:
+                                    processed_content = processed_content.replace(replacement, char)
+
+                            if f" {word} " in f" {processed_content} ":
+                                found_messages.append(message)
+                                break
+
+                    else:  # High strictness
+                        # Most aggressive detection
+                        for word in bad_words:
+                            if f" {word} " in f" {content_lower} ":
+                                found_messages.append(message)
+                                break
+
+                            # Transform content by removing special characters and spaces
+                            transformed_content = ''.join(c for c in content_lower if c.isalnum())
+                            transformed_word = ''.join(c for c in word if c.isalnum())
+
+                            if transformed_word in transformed_content:
+                                found_messages.append(message)
+                                break
+
+                            # Check for letter substitutions (most aggressive)
+                            processed_content = content_lower
+                            for char, replacements in substitutions.items():
+                                for replacement in replacements:
+                                    processed_content = processed_content.replace(replacement, char)
+
+                            # Remove spaces for most aggressive detection
+                            processed_content = ''.join(processed_content.split())
+                            word_no_spaces = ''.join(word.split())
+
+                            if word_no_spaces in processed_content:
+                                found_messages.append(message)
+                                break
+
+                    # Update status periodically
+                    if total_searched % 100 == 0:
+                        last_update_time = await update_search_status(
+                            status_msg, channels_searched, len(search_channels),
+                            total_searched, len(found_messages), start_time,
+                            last_update_time, search_cancelled
+                        )
+
+                    if search_cancelled:
+                        break
+
+            except discord.Forbidden:
+                # Skip channels we don't have access to
+                pass
+            except discord.HTTPException as e:
+                await ctx.send(f"⚠️ Error in channel #{channel.name}: {e}")
+
+        # Calculate search time
+        search_time = (datetime.now() - start_time).total_seconds()
+
+        # Handle cancelled scan
+        if search_cancelled:
+            await status_msg.edit(content=f"🛑 Scan cancelled. Found {len(found_messages)} bad word matches in {total_searched:,} messages before cancellation.")
+            return
+
+        # Show results
+        if not found_messages:
+            await status_msg.edit(content=f"✅ Scan complete! No messages containing bad words found (searched {total_searched:,} messages in {search_time:.1f}s)")
+        else:
+            # Prepare results message
+            result_chunks = []
+            current_chunk = f"✅ **Bad Word Scan Results**\nFound {len(found_messages)} messages with bad word matches (searched {total_searched:,} messages in {search_time:.1f}s):\n\n"
+
+            # Limit to 50 messages to avoid excessive output
+            max_results = min(50, len(found_messages))
+
+            for i, message in enumerate(found_messages[:max_results]):
+                # Format timestamp
+                timestamp = message.created_at.strftime('%Y-%m-%d %H:%M:%S')
+
+                # Format message with truncation
+                content = message.content
+                if len(content) > 100:  # Truncate long messages
+                    content = content[:97] + "..."
+
+                # Create message entry
+                message_line = f"{i+1}. [{timestamp}] {message.author.name}: {content}\n   ↳ {message.jump_url}\n\n"
+
+                # Check if adding this message would exceed Discord's message limit
+                if len(current_chunk) + len(message_line) > 1950:  # Leave some buffer
+                    result_chunks.append(current_chunk)
+                    current_chunk = message_line
+                else:
+                    current_chunk += message_line
+
+            # Add the last chunk if it has content
+            if current_chunk:
+                result_chunks.append(current_chunk)
+
+            # Add note about limited results if needed
+            if len(found_messages) > max_results:
+                note = f"\nNote: Showing only {max_results} of {len(found_messages)} matches to avoid excessive output."
+
+                # Check if adding the note would exceed Discord's message limit
+                if len(result_chunks[-1]) + len(note) <= 1950:
+                    result_chunks[-1] += note
+                else:
+                    result_chunks.append(note)
+
+            # Send results in chunks
+            if result_chunks:
+                # Edit the status message with the first chunk
+                await status_msg.edit(content=result_chunks[0])
+
+                # Send additional chunks as new messages
+                for chunk in result_chunks[1:]:
+                    await ctx.send(chunk)
+
+    except Exception as e:
+        await ctx.send(f"⚠️ Error during scan: {e}")
+    finally:
+        scan_bad_words.is_running = False
+        search_cancelled = False
+
+
+# --- Utility Commands ---
 @bot.command(name="clearcache")
 async def clear_cache(ctx):
     """Clear all cached data"""

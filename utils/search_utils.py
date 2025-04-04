@@ -1,7 +1,8 @@
 # utils/search_utils.py
-import asyncio
-import discord
 from datetime import datetime
+
+import discord
+
 
 async def process_search_channels(ctx, include_channels, exclude_channels):
     """Process and return channels to search based on include/exclude filters"""
@@ -26,6 +27,7 @@ async def process_search_channels(ctx, include_channels, exclude_channels):
 
     return search_channels
 
+
 async def update_search_status(status_msg, channels_searched, total_channels,
                                messages_searched, messages_found, start_time,
                                last_update_time, search_cancelled):
@@ -46,6 +48,7 @@ async def update_search_status(status_msg, channels_searched, total_channels,
         return current_time
 
     return last_update_time
+
 
 def update_search_stats(search_stats, ctx, total_searched, found_messages, search_time):
     """Update global search statistics"""
